@@ -1,0 +1,139 @@
+# Roda localmente os mesmos gates do pipeline (.github/workflows/ci.yml).
+#
+# Uso:
+#   .\scripts\validar.ps1
+#   .\scripts\validar.ps1 -Cobertura   # abre o relatorio de cobertura no navegador
+#
+# A ideia e nunca descobrir no CI algo que daria para ver aqui em um minuto.
+[CmdletBinding()]
+param(
+    [switch]$Cobertura
+)
+
+$ErrorActionPreference = "Stop"
+$raiz = Split-Path -Parent $PSScriptRoot
+Push-Location $raiz
+
+$falhas = @()
+
+function Etapa {
+    param([string]$Nome, [scriptblock]$Acao)
+
+    Write-Host ""
+    Write-Host "== $Nome" -ForegroundColor Cyan
+    try {
+        & $Acao
+        Write-Host "   OK" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "   FALHOU: $($_.Exception.Message)" -ForegroundColor Red
+        $script:falhas += $Nome
+    }
+}
+
+try {
+    Etapa "Formatacao (gofmt)" {
+        $foraDoPadrao = gofmt -l .
+        if ($foraDoPadrao) {
+            $foraDoPadrao | ForEach-Object { Write-Host "   $_" -ForegroundColor Yellow }
+            throw "rode: gofmt -w ."
+        }
+    }
+
+    Etapa "Dependencias (go mod tidy)" {
+        # Compara o conteudo antes e depois, nao o git status: localmente o
+        # go.mod costuma ter alteracao legitima ainda nao comitada, e usar o
+        # git aqui reprovaria por isso em vez de pelo que o tidy fez.
+        $antes = @{}
+        foreach ($f in "go.mod", "go.sum") { $antes[$f] = Get-Content $f -Raw }
+
+        & go mod tidy
+        if ($LASTEXITCODE -ne 0) { throw "go mod tidy falhou" }
+
+        foreach ($f in "go.mod", "go.sum") {
+            if ((Get-Content $f -Raw) -ne $antes[$f]) {
+                throw "$f mudou com o go mod tidy; revise e comite o resultado"
+            }
+        }
+    }
+
+    Etapa "Analise estatica (go vet)" {
+        & go vet ./...
+        if ($LASTEXITCODE -ne 0) { throw "go vet apontou problemas" }
+    }
+
+    # As aspas em "-flag=valor" nao sao decorativas: sem elas o PowerShell
+    # quebra o argumento no "=" e o go recebe dois tokens.
+    Etapa "Testes" {
+        & go test ./... -count=1 "-covermode=atomic" "-coverprofile=cobertura.out"
+        if ($LASTEXITCODE -ne 0) { throw "testes falharam" }
+    }
+
+    Etapa "Cobertura total" {
+        $linhas = & go tool cover "-func=cobertura.out"
+        if ($LASTEXITCODE -ne 0) { throw "nao foi possivel ler a cobertura" }
+        Write-Host "   $($linhas | Select-Object -Last 1)"
+    }
+
+    # O detector de corrida precisa de CGO e de um compilador C. Em maquina de
+    # dev sem mingw isso simplesmente nao esta disponivel -- o CI cobre.
+    if (Get-Command gcc -ErrorAction SilentlyContinue) {
+        Etapa "Detector de corrida" {
+            $env:CGO_ENABLED = "1"
+            try {
+                & go test ./... -count=1 -race
+                if ($LASTEXITCODE -ne 0) { throw "detector de corrida acusou problema" }
+            }
+            finally {
+                Remove-Item Env:\CGO_ENABLED -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    else {
+        Write-Host ""
+        Write-Host "== Detector de corrida" -ForegroundColor Cyan
+        Write-Host "   PULADO: gcc nao encontrado (o CI roda esta etapa)." -ForegroundColor DarkGray
+    }
+
+    # Mesmo gate do job "seguranca" do CI. Fica opcional porque depende de uma
+    # ferramenta externa e de rede; sem ela, instale com:
+    #   go install golang.org/x/vuln/cmd/govulncheck@latest
+    $govulncheck = Get-Command govulncheck -ErrorAction SilentlyContinue
+    if (-not $govulncheck) {
+        $candidato = Join-Path (& go env GOPATH) "bin\govulncheck.exe"
+        if (Test-Path $candidato) { $govulncheck = $candidato }
+    }
+    if ($govulncheck) {
+        Etapa "Vulnerabilidades conhecidas" {
+            & $govulncheck ./...
+            # 3 = encontrou vulnerabilidade que o codigo de fato chama.
+            if ($LASTEXITCODE -ne 0) { throw "govulncheck reprovou (codigo $LASTEXITCODE)" }
+        }
+    }
+    else {
+        Write-Host ""
+        Write-Host "== Vulnerabilidades conhecidas" -ForegroundColor Cyan
+        Write-Host "   PULADO: govulncheck nao encontrado (o CI roda esta etapa)." -ForegroundColor DarkGray
+        Write-Host "   Instale com: go install golang.org/x/vuln/cmd/govulncheck@latest" -ForegroundColor DarkGray
+    }
+
+    Etapa "Compilacao" {
+        & go build -o "$env:TEMP\cais-validacao.exe" .
+        if ($LASTEXITCODE -ne 0) { throw "go build falhou" }
+        Remove-Item "$env:TEMP\cais-validacao.exe" -ErrorAction SilentlyContinue
+    }
+
+    if ($Cobertura) {
+        & go tool cover -html=cobertura.out
+    }
+
+    Write-Host ""
+    if ($falhas.Count -gt 0) {
+        Write-Host "Validacao reprovada em: $($falhas -join ', ')" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Validacao completa: tudo passou." -ForegroundColor Green
+}
+finally {
+    Pop-Location
+}

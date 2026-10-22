@@ -60,23 +60,77 @@ Duas coisas, e vale saber antes de instalar:
 
 ## Instalar
 
-Pegue o `.exe` na página de [releases](../../releases) ou compile:
+Pegue o binário na página de [releases](../../releases) ou compile:
 
-```bash
+```powershell
 git clone https://github.com/YuriBertoldi/Cais.git
 cd Cais
-go build -o cais.exe .
+.\scripts\build.ps1                      # cais.exe (Windows)
+.\scripts\build.ps1 -Plataforma linux    # cais-linux-amd64
+.\scripts\build.ps1 -Plataforma ambos
 ```
+
+Use o script, não `go build` direto: é ele que aplica o `-H=windowsgui`, sem o
+qual o `.exe` abre uma janela de console que fica aberta enquanto o painel
+roda. Para arquitetura, `-Arquitetura arm64`.
 
 Se baixou da internet, o Windows pode bloquear o executável por não ser
 assinado. Resolve com `Unblock-File .\cais.exe` no PowerShell.
 
+### No Linux
+
+O binário é o mesmo painel, com três diferenças que o próprio executável já
+resolve: fala com o daemon pelo socket Unix (`unix:///var/run/docker.sock`, o
+padrão ali), roda o `docker compose` direto em vez de pelo WSL, e abre o
+navegador com `xdg-open`.
+
+```bash
+chmod +x cais-linux-amd64
+./cais-linux-amd64
+```
+
+Seu usuário precisa de permissão no socket — normalmente, estar no grupo
+`docker`.
+
+### Onde ficam os arquivos
+
+O painel grava `painel.db` e `cais.log` na mesma pasta, apontada por `-db`.
+No Windows o padrão é `%LOCALAPPDATA%\Cais`; no Linux, `~/.cache/Cais`.
+
+O log existe porque o `.exe` não tem console: sem ele, um erro de inicialização
+não apareceria em lugar nenhum. Falha que impede o painel de subir também vira
+uma caixa de mensagem.
+
 ## Antes de rodar: o Docker precisa estar acessível
 
 O Cais não embute motor nenhum. Ele conversa com um Docker Engine que já exista,
-pela Engine API em TCP.
+pela Engine API, por um de três transportes:
 
-Se o seu daemon ainda não escuta em TCP, crie
+| Transporte | `-docker-host` | Exige |
+|---|---|---|
+| TCP | `tcp://127.0.0.1:2375` (padrão no Windows) | Daemon escutando em TCP, **sem autenticação** |
+| WSL (`dial-stdio`) | `wsl://<distro>` | Só o `docker` instalado na distro WSL |
+| Socket Unix | `unix:///var/run/docker.sock` (padrão no Linux) | Permissão no arquivo de socket |
+
+### Opção sem abrir porta: `wsl://`
+
+No Windows com WSL2 dá para não expor porta nenhuma. Com
+`-docker-host wsl://Ubuntu-24.04`, o Cais executa
+`wsl.exe -d Ubuntu-24.04 --exec docker system dial-stdio` e fala com o daemon
+pelo stdin/stdout desse processo, o mesmo transporte que o próprio Docker usa em
+`ssh://`. O daemon continua só no socket Unix, e só quem consegue executar o
+`wsl.exe` na sessão do usuário alcança a Engine API.
+
+```bash
+cais -docker-host wsl://Ubuntu-24.04 -wsl-distro Ubuntu-24.04
+```
+
+`wsl://` sem nome usa a distro padrão do WSL. Cada conexão da API é um processo
+`wsl.exe`, encerrado quando a conexão fecha.
+
+### Opção TCP
+
+Se preferir TCP e o seu daemon ainda não escuta nele, crie
 `/etc/systemd/system/docker.service.d/override.conf`:
 
 ```ini
@@ -114,10 +168,10 @@ tem um rodando, abre o navegador nele e sai de cena.
 | Opção | Padrão | Para quê |
 |---|---|---|
 | `-porta` | `45678` | Porta de escuta. `0` pega qualquer uma livre |
-| `-docker-host` | `tcp://127.0.0.1:2375` | Onde está a Engine API |
+| `-docker-host` | `tcp://...` no Windows, `unix://...` no Linux | Onde está a Engine API: `tcp://host:porta`, `wsl://distro` ou `unix:///caminho` |
 | `-wsl-distro` | `Ubuntu-24.04` | Distro usada para rodar o `docker compose` |
 | `-no-browser` | — | Não abrir o navegador ao iniciar |
-| `-db` | `%LOCALAPPDATA%\Cais\painel.db` | Banco local |
+| `-db` | `%LOCALAPPDATA%\Cais\painel.db` | Banco local. O `cais.log` fica na mesma pasta |
 | `-dev` | `false` | Lê template e CSS do disco |
 
 ## Segurança
@@ -175,6 +229,36 @@ portanto dispensa toolchain C em quem for compilar. Numa equipe de Windows isso
 go run . -dev
 go vet ./...
 ```
+
+### Validar antes de abrir PR
+
+```powershell
+.\scripts\validar.ps1              # mesmos gates do CI
+.\scripts\validar.ps1 -Cobertura   # abre o relatório de cobertura no navegador
+```
+
+O script roda formatação (`gofmt`), `go mod tidy`, `go vet`, os testes com
+cobertura e a compilação. Duas etapas são puladas com aviso quando a ferramenta
+não está na máquina, porque o CI as cobre de qualquer forma:
+
+- o detector de corrida (`-race`), que precisa de CGO e de um compilador C;
+- o `govulncheck`, que se instala com
+  `go install golang.org/x/vuln/cmd/govulncheck@latest`.
+
+Vale instalar o `govulncheck`: ele reprova por vulnerabilidade **da biblioteca
+padrão** que o código de fato chama, então uma versão do Go atrasada em
+patches derruba o pipeline sozinha, sem nenhuma dependência nossa estar
+envolvida. É por isso que o CI usa `go-version: stable` e não a diretiva `go`
+do `go.mod` — aquela declara a versão mínima da linguagem, não o toolchain a
+usar para compilar.
+
+O pipeline (`.github/workflows/ci.yml`) repete tudo isso em `windows-latest` —
+o alvo real do produto, já que parte do comportamento depende de caminho
+Windows e do WSL —, roda `govulncheck` em Linux e, no job de build, sobe o
+`.exe` gerado e confere que o `/healthz` responde. Os testes **não** falam com
+o Docker nem chamam o `wsl.exe`: o cliente da Engine API é apontado para um
+`httptest.Server` que finge ser o daemon, e o painel é exercitado com
+`Docker: nil`, que é o estado de quem acabou de instalar.
 
 Convenções:
 
